@@ -10,7 +10,7 @@
 # language governing permissions and limitations under the License.
 #
 #
-# Script Version: 1.3.6
+# Script Version: 1.4.3
 #
 
 from optparse import OptionParser
@@ -20,6 +20,8 @@ import re
 import subprocess
 import sys
 import shutil
+
+from contextlib import contextmanager
 
 try:
     # 3.x imports
@@ -33,7 +35,8 @@ except ImportError:
 LAUNCHER_SCRIPT = """#!/bin/sh
 # Version: $VERSION$
 echo -n $$ > $PIDFILE$
-/usr/bin/env -i AWS_CONFIG_FILE=$AWS_CONFIG_FILE$ HOME=$HOME$ $NICE_PATH$ -n 4 $CLIPATH$ logs push --config-file $AGENT_CONFIG_FILE$ >> /var/log/awslogs.log 2>&1
+[ -f $AWS_PROXY_CONFIG_FILE$ ] && . $AWS_PROXY_CONFIG_FILE$
+/usr/bin/env -i HTTPS_PROXY=$HTTPS_PROXY HTTP_PROXY=$HTTP_PROXY NO_PROXY=$NO_PROXY AWS_CONFIG_FILE=$AWS_CONFIG_FILE$ HOME=$HOME$ $NICE_PATH$ -n 4 $CLIPATH$ logs push --config-file $AGENT_CONFIG_FILE$ --additional-configs-dir $AGENT_ADDITIONAL_CONFIGS_DIR$ >> /var/log/awslogs.log 2>&1
 """
 
 NANNY_SCRIPT = """#!/bin/sh
@@ -87,7 +90,14 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 30 * * * * root logrotate -s /var/log/logstatus /etc/logrotate.d/awslogs
 """
 
-AWSLOGS_VERSION = "1.3.6"
+PROXY_CONFIG = """
+# Version: {VERSION}
+# Refer to http://docs.aws.amazon.com/cli/latest/userguide/cli-http-proxy.html for details.
+HTTP_PROXY={http_proxy}
+HTTPS_PROXY={https_proxy}
+NO_PROXY={no_proxy}"""
+
+AWSLOGS_VERSION = "1.4.3"
 HOME = os.path.expandvars("$HOME")
 AWSLOGS_HOME = "/var/awslogs"
 AWSLOGS_BIN = AWSLOGS_HOME + "/bin"
@@ -97,7 +107,9 @@ AGENT_STATE_DIR = AWSLOGS_HOME + "/state"
 AGENT_ETC_DIR = AWSLOGS_HOME + "/etc"
 AGENT_SETUP_LOG_FILE = "/var/log/awslogs-agent-setup.log"
 AGENT_CONFIG_FILE = AGENT_ETC_DIR + "/awslogs.conf"
+AGENT_ADDITIONAL_CONFIGS_DIR = AGENT_ETC_DIR + "/config"
 AWS_CONFIG_FILE = AGENT_ETC_DIR + "/aws.conf"
+AWS_PROXY_CONFIG_FILE = AGENT_ETC_DIR + "/proxy.conf"
 AGENT_LAUNCHER = AWSLOGS_BIN + "/awslogs-agent-launcher.sh"
 AGENT_NANNY_PATH = AWSLOGS_BIN + "/awslogs-nanny.sh"
 AGENT_LOCK_FILE = AGENT_STATE_DIR + "/awslogs.lock"
@@ -162,6 +174,17 @@ do_start () {
         $START_CMD
         RETVAL=$?
         touch $LOCKFILE
+
+        for i in {1..5}
+        do
+            $STATUS_CMD
+            if [ $? -ne 0 ];then
+                echo "`date +%F_%T_%N` status is not running, sleep 2 second"
+                sleep 2
+            else
+                break
+            fi
+        done
     ) 9>$MUTEXFILE
     rm -f $MUTEXFILE
 }
@@ -277,12 +300,17 @@ DEFAULT_CONFIG = """
 # ------------------------------------------
 # CONFIGURATION DETAILS
 # ------------------------------------------
+# Refer to http://docs.aws.amazon.com/AmazonCloudWatch/latest/DeveloperGuide/AgentReference.html for details.
 
 [general]
 # Path to the CloudWatch Logs agent's state file. The agent uses this file to maintain
 # client side state across its executions.
 state_file = /var/awslogs/state/agent-state
 
+## This queue size determine the max number of event batch loaded into memory. 10 is the default value.
+## It can be reduced if the program consumes too much memory. 1 is the valid minimum value.
+#queue_size = 10
+#
 ## Each log file is defined in its own section. The section name doesn't
 ## matter as long as its unique within this file.
 #[kern.log]
@@ -375,6 +403,7 @@ PLATFORM_NOT_SUPPORTED = 3
 CONFIG_FILE_NOT_FOUND = 4
 UNSUPPORTED_REGION = 5
 MISSING_DEPENDENCY = 6
+STANDALONE_INSTALLATION_FAILURE = 7
 
 class CloudWatchLogsAgentSetup:
     Rhel, Ubuntu, AmazonLinux, CentOS, Raspbian, Debian = range(6)
@@ -395,17 +424,26 @@ class CloudWatchLogsAgentSetup:
         self.os_flavor = self.get_distro_info()
         self.plugin_url = options.plugin_url
         self.python = options.python
+        self.http_proxy = options.http_proxy if options.http_proxy else ""
+        self.https_proxy = options.https_proxy if options.https_proxy else ""
+        self.no_proxy = options.no_proxy if options.no_proxy else ""
         self.generated_filepaths = []
+        self.dependency_path = options.dependency_path if options.dependency_path else ""
+        self.is_standalone = not self.dependency_path == ""
+        self.ca_bundle = options.ca_bundle if options.ca_bundle else ""
+
 
     def write_launcher_file(self):
         file_path = AGENT_LAUNCHER
-        nicepath = subprocess.Popen(['which', 'nice'], stdout=subprocess.PIPE).communicate()[0].rstrip()
+        nicepath = subprocess.Popen(['which', 'nice'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
         contents = LAUNCHER_SCRIPT.replace("$REGION$", self.region)
         contents = contents.replace("$HOME$", HOME)
         contents = contents.replace("$NICE_PATH$", nicepath)
         contents = contents.replace("$CLIPATH$", AWSCLI_CMD)
+        contents = contents.replace("$AWS_PROXY_CONFIG_FILE$", AWS_PROXY_CONFIG_FILE)
         contents = contents.replace("$PIDFILE$", AGENT_PID_FILE)
         contents = contents.replace("$AGENT_CONFIG_FILE$", AGENT_CONFIG_FILE)
+        contents = contents.replace("$AGENT_ADDITIONAL_CONFIGS_DIR$", AGENT_ADDITIONAL_CONFIGS_DIR)
         contents = contents.replace("$AWS_CONFIG_FILE$", AWS_CONFIG_FILE)
         contents = contents.replace("$VERSION$", AWSLOGS_VERSION)
         with open(file_path, "w") as file:
@@ -437,7 +475,7 @@ class CloudWatchLogsAgentSetup:
         else:
             fail("Failed to determine linux distribution. Exiting.", PLATFORM_NOT_SUPPORTED)
 
-        # Support Amazon Linux, Ubuntu, CentOS, Debian and RHEL.
+        # Support Amazon Linux, Ubuntu, CentOS, Debian, Raspbian and RHEL.
         with open(issue_file_path, "r") as issue_file:
             line = issue_file.readline()
             if line.startswith("Amazon Linux AMI"):
@@ -452,6 +490,8 @@ class CloudWatchLogsAgentSetup:
                 return self.Raspbian
             elif line.startswith("Debian"):
                 return self.Debian
+            elif line.startswith("OpenVPN Access Server Appliance"):
+                return self.Debian
             else:
                 fail("Failed to determine linux distribution. Exiting.", PLATFORM_NOT_SUPPORTED)
 
@@ -464,14 +504,21 @@ class CloudWatchLogsAgentSetup:
 
     def install_awslogs_cli(self):
 
-        subprocess.call(['pip',
-                         'install',
-                         'virtualenv'],
-                         stderr=self.log_file,
-                         stdout=self.log_file)
+        if self.is_standalone:
+            # If this is standalone installation, use the virtual env
+            # package in the dependency folder to set up AWSLOGS_HOME as
+            # the virtual env.
+            self.validate_dependency_path(self.dependency_path)
+            self.setup_virtualenv()
+        else:
+            # No local dependency folder provided, install virtualenv
+            # from pip.
+            self.do_pip_install('virtualenv', False)
+
         # Do not make AWSLOGS_HOME virtualenv again if it's done before.
         # The cmd will fail to overwrite running executable, e.g. python.
         if not os.path.exists(VIRTUALENV_ACTIVATE_CMD):
+
             venv_in_path = (subprocess.call(["which", "virtualenv"], stderr=self.log_file, stdout=self.log_file) == 0)
             if venv_in_path:
                 venv_cmd = ["virtualenv"]
@@ -491,23 +538,46 @@ class CloudWatchLogsAgentSetup:
                             stdout=self.log_file)
             if venv_response != 0:
                 fail("Failed to create virtualenv. Try manually installing with pip and adding it to the sudo user's PATH before running this script.", MISSING_DEPENDENCY)
+
         # Downgrade pip if needed so installing from S3 is possible
-        subprocess.call([AWSLOGS_BIN + '/pip',
-                         'install',
-                         'pip<7.0.0'],
-                         stderr=self.log_file,
-                         stdout=self.log_file)
-        subprocess.call([AWSLOGS_BIN + '/pip',
-                         'install',
-                         '--upgrade',
-                         '--extra-index-url=' + self.plugin_url,
-                         'awscli-cwlogs==1.3.1'],
-                         stderr=self.log_file,
-                         stdout=self.log_file)
+        self.do_pip_install('pip<7.0.0')
+        python_version = sys.version_info
+        need_wheel_29 = False
+        if python_version >= (2, 6) and python_version < (2, 7):
+            need_wheel_29 = True
+        if self.is_standalone:
+            plugin_path = os.path.join(self.dependency_path, 'awslogscli')
+            # Note: As part of the standalone installation feature, the version
+            # of the awscli that the Logs plugin dependes on has been bumped up
+            # and so is the version number of the Logs Plugin itself.
+            # For standalone installation, the dependency packages will be vended
+            # in an S3 bucket, so using the bumped up version here. For standard
+            # installation, the pypy repository would need awscli-cwlogs==1.4.1
+            # to be made available before we can refer to it in the script.
+            self.do_pip_install('awscli-cwlogs==1.4.4', True, plugin_path, True)
+        else:
+            # Check for plugin_url if we are not doing Standalone installation
+            # For standalone installation we will ignore plugin url and simply
+            # install from the dependency folder.
+            if self.plugin_url:
+                if need_wheel_29:
+                    self.do_pip_install('wheel==0.29.0', True, None, True, self.plugin_url)
+                self.do_pip_install('awscli-cwlogs==1.4.4', True, None, True, self.plugin_url)
+            else:
+                if need_wheel_29:
+                    self.do_pip_install('wheel==0.29.0', True, None, True)
+                self.do_pip_install('awscli-cwlogs==1.4.4', True, None, True)
+
         # Setup awslogs plugin
         subprocess.call([AWSCLI_CMD, 'configure', 'set', 'plugins.cwlogs', 'cwlogs'], env=DEFAULT_ENV)
+
         # Setup the default region for the CLI
         subprocess.call([AWSCLI_CMD, 'configure', 'set', 'default.region', self.region], env=DEFAULT_ENV)
+
+        # If the user provided a path to a CA certificate bundle to use when
+        # verifying SSL certificates, configure the default ca_bundle on the aws cli.
+        if not self.ca_bundle == "":
+            subprocess.call([AWSCLI_CMD, 'configure', 'set', 'default.ca_bundle', self.ca_bundle], env=DEFAULT_ENV)
 
     @staticmethod
     def aws_configure():
@@ -562,6 +632,9 @@ class CloudWatchLogsAgentSetup:
         self.log_generated_file("/etc/rc5.d/S99awslogs")
         self.log_generated_file("/etc/rc6.d/S99awslogs")
 
+        if self.os_flavor == self.Debian or self.os_flavor == self.Ubuntu:
+            subprocess.call(['/usr/sbin/update-rc.d', 'awslogs', 'defaults'], env=DEFAULT_ENV, stderr=self.log_file, stdout=self.log_file)
+
     def setup_agent_as_daemon(self):
         # We use init.d for AmazonLinux and Upstart for Ubuntu.
         if self.os_flavor == self.AmazonLinux or self.os_flavor == self.Ubuntu or self.os_flavor == self.Rhel or self.os_flavor == self.CentOS or self.os_flavor == self.Raspbian or self.os_flavor == self.Debian:
@@ -569,17 +642,130 @@ class CloudWatchLogsAgentSetup:
         else:
             fail("Unsupported platform.", PLATFORM_NOT_SUPPORTED)
 
+    @contextmanager
+    def cd(self, dirname):
+        original = os.getcwd()
+        os.chdir(dirname)
+        try:
+            yield
+        finally:
+            os.chdir(original)
+
+    def run(self, cmd):
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+        stdout, stderr = p.communicate()
+        if p.returncode != 0:
+            raise BadRCError("Bad rc (%s) for cmd '%s': %s" % (p.returncode, cmd, stdout + stderr))
+        return stdout
+
+    def do_pip_install(self, package_descriptor, virtual_env_pip=True, folder_path=None, do_upgrade=False, extra_index_url=None):
+        """
+        Install packages using pip. Generates the command for the pip
+        install based on the parameters provided. For standalone installation
+        defaults to the path of the dependency folder unless an explicit
+        folder_path is passed in.
+        """
+        pip_path = AWSLOGS_BIN + '/pip'
+        if not virtual_env_pip:
+            pip_path = 'pip'
+
+        install_cmd = [pip_path, 'install']
+
+        if do_upgrade:
+            install_cmd.append('--upgrade')
+
+        if self.is_standalone:
+            install_cmd.extend(['--no-index', '--find-links'])
+            if folder_path is None:
+               folder_path = self.dependency_path
+            install_cmd.append(folder_path)
+
+        install_cmd.append(package_descriptor)
+
+        if extra_index_url and not self.is_standalone:
+            install_cmd.append('--extra-index-url=' + extra_index_url)
+
+        subprocess.call(install_cmd,
+                        stderr=self.log_file,
+                        stdout=self.log_file)
+
+    # Make AWSLOGS_HOME as the virtual env, which will also make
+    # pip available in the same folder.
+    def setup_virtualenv(self):
+        dependency_dir = self.dependency_path
+        virtual_env_dir = ""
+
+        with self.cd(dependency_dir):
+            for directory in os.listdir('.'):
+                if directory.startswith('virtualenv'):
+                        virtual_env_dir = directory
+
+        if virtual_env_dir == "":
+            fail("Failed to find the virtual env folder in the dependency_path folder", STANDALONE_INSTALLATION_FAILURE)
+
+        virtual_env_script = os.path.join(dependency_dir, virtual_env_dir, "virtualenv.py")
+
+        python_interpreter = sys.executable
+        if self.python:
+            python_interpreter = self.python
+
+        # Try to stop the awslogs service if it is running.
+        # It is OK if this call fails when it is 1st time to install the awslogs.
+        subprocess.call(['service', 'awslogs', 'stop'], stderr=self.log_file, stdout=self.log_file)
+
+        self.run('%s %s --python %s %s --no-download' % (sys.executable,
+                                                         virtual_env_script,
+                                                         python_interpreter,
+                                                         AWSLOGS_HOME))
+
+    def validate_dependency_path(self, path):
+        if not os.path.exists(path):
+            fail("Make sure the dependency_path points to the correct folder. Path doesn't exist: " + path, STANDALONE_INSTALLATION_FAILURE)
+
+    def install_system_dependencies(self):
+        self.install_pip()
+        self._install_ubuntu_dependencies()
+
+    def _install_ubuntu_dependencies(self):
+        if self.os_flavor == self.Ubuntu or self.os_flavor == self.Debian:
+            libyaml_dev_installed = self._package_installed("libyaml-dev")
+            python_dev_installed = self._package_installed("python-dev")
+            if libyaml_dev_installed and (not python_dev_installed):
+                self.install("python-dev")
+
     def install_pip(self):
-        if not executable_exists("pip"):
+
+        # For standalone installation, no need to check for the existence
+        # of pip, we will simply be using the virtualenv packages in the
+        # dependency folder to activate AWSLOGS_HOME as the virtualenv.
+        if not self.is_standalone and not executable_exists("pip"):
             if self.os_flavor == self.Rhel or self.os_flavor == self.CentOS:
                 self.install("python-setuptools")
                 subprocess.call(['easy_install', 'pip'], stdout=self.log_file, stderr=self.log_file)
             else:
                 self.install("python-pip")
 
+        # If this is not standalone installation and pip executable still
+        # doesn't exist, we have a problem
+        if not self.is_standalone and not executable_exists("pip"):
+            fail("Could not install pip. Please try again or see " + AGENT_SETUP_LOG_FILE + " for more details")
+
+    def _package_installed(self, package_name):
+        devnull = open(os.devnull, "w")
+        if self.os_flavor == self.Ubuntu or self.os_flavor == self.Debian:
+            ret_val = subprocess.call(["dpkg", "-s", package_name], stdout=self.log_file, stderr=self.log_file)
+        else:
+            ret_val = subprocess.call(["rpm", "-q", package_name], stdout=self.log_file, stderr=self.log_file)
+        devnull.close()
+        if ret_val != 0:
+            message(package_name + " does not exist in system ")
+            return False
+        return True
+
     def setup_agent_log_file_rotation(self):
         config = AGENT_LOG_ROTATE_CONFIG
-        if self.os_flavor == self.Ubuntu:
+        if self.os_flavor == self.Ubuntu or self.os_flavor == self.Debian:
             config = config.replace('$SU_FOR_UBUNTU$','su root root')
         else:
             config = config.replace('$SU_FOR_UBUNTU$','')
@@ -603,10 +789,10 @@ class CloudWatchLogsAgentSetup:
 
     def write_nanny_script(self):
         file_path = AGENT_NANNY_PATH
-        ps_path = subprocess.Popen(['which', 'ps'], stdout=subprocess.PIPE).communicate()[0].rstrip()
-        grep_path = subprocess.Popen(['which', 'grep'], stdout=subprocess.PIPE).communicate()[0].rstrip()
-        cat_path = subprocess.Popen(['which', 'cat'], stdout=subprocess.PIPE).communicate()[0].rstrip()
-        service_path = subprocess.Popen(['which', 'service'], stdout=subprocess.PIPE).communicate()[0].rstrip()
+        ps_path = subprocess.Popen(['which', 'ps'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
+        grep_path = subprocess.Popen(['which', 'grep'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
+        cat_path = subprocess.Popen(['which', 'cat'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
+        service_path = subprocess.Popen(['which', 'service'], stdout=subprocess.PIPE, universal_newlines=True).communicate()[0].rstrip()
         contents = NANNY_SCRIPT.replace("$PIDFILE$", AGENT_PID_FILE)
         contents = contents.replace("$LOCKFILE$", AGENT_LOCK_FILE)
         contents = contents.replace("$AGENT_LAUNCHER$", AGENT_LAUNCHER)
@@ -656,13 +842,19 @@ class CloudWatchLogsAgentSetup:
             os.mkdir(AGENT_STATE_DIR)
         if not os.path.exists(AGENT_ETC_DIR):
             os.mkdir(AGENT_ETC_DIR)
+        if not os.path.exists(AGENT_ADDITIONAL_CONFIGS_DIR):
+            os.mkdir(AGENT_ADDITIONAL_CONFIGS_DIR)
 
-        if self.os_flavor == self.Ubuntu:
+        if not self.is_standalone and (self.os_flavor == self.Ubuntu or self.os_flavor == self.Debian):
             subprocess.call(['apt-get', 'update'], stdout=self.log_file, stderr=self.log_file)
+
+        with open(AWS_PROXY_CONFIG_FILE, "w") as config:
+            config.write(PROXY_CONFIG.format(http_proxy=self.http_proxy, https_proxy=self.https_proxy, no_proxy=self.no_proxy, VERSION=AWSLOGS_VERSION))
+        self.log_generated_file(AWS_PROXY_CONFIG_FILE)
 
         if not self.only_generate_config:
             message("\nStep 1 of 5: Installing pip ...")
-            self.install_pip()
+            self.install_system_dependencies()
             status("DONE")
             message("Step 2 of 5: Downloading the latest CloudWatch Logs agent bits ... ")
             self.install_awslogs_cli()
@@ -819,13 +1011,25 @@ def parse_args():
                       help="Local path, S3 path or http(s) based URL of the CloudWatch Logs agent's configuration file.")
 
     # Optional parameter for the custom CLI url. This is only used for testing purposes.
-    parser.add_option("-u", "--plugin-url", dest="plugin_url", default='http://aws-cloudwatch.s3-website-us-east-1.amazonaws.com/',
-                      help="URL of CloudWatch Logs plugin.")
+    parser.add_option("-u", "--plugin-url", dest="plugin_url", help="URL of CloudWatch Logs plugin.")
     parser.add_option("-p", "--python", dest="python",
                       help="The Python interpreter to use. The default is the interpreter that virtualenv was installed with (/usr/bin/python)")
+    parser.add_option("--http-proxy", dest="http_proxy", help="The http proxy that's used to communicate with CloudWatch Logs service.")
+    parser.add_option("--https-proxy", dest="https_proxy", help="The https proxy that's used to communicate with CloudWatch Logs service.")
+    parser.add_option("--no-proxy", dest="no_proxy", help="A comma-separated list of domain extensions the proxy should not be used for.")
 
+    # Optional parameter to specify a local folder for standalone installation.
+    # Useful if you do not have access to pip repositories or limited external connectivity.
+    # Needs necessary dependency packages to be available locally.
+    parser.add_option("--dependency-path", dest="dependency_path", help="Path to local folder that has the dependency packages")
+    parser.add_option("--ca-bundle", dest="ca_bundle", help="Path for the CA certificate bundle to use for verifying SSL certificates.")
     options, args = parser.parse_args()
     return options
+
+
+class BadRCError(Exception):
+    pass
+
 
 #
 # Utility methods to deal with console output.
@@ -1091,8 +1295,8 @@ def main():
         fail("This script doesn't support Microsoft Windows", PLATFORM_NOT_SUPPORTED)
 
     python_version = sys.version_info
-    if python_version < (2,6) or python_version > (3,3):
-        fail("This script only supports python version 2.6 - 3.3", PLATFORM_NOT_SUPPORTED)
+    if python_version < (2,6) or python_version >= (3,6):
+        fail("This script only supports python version 2.6 - 3.5", PLATFORM_NOT_SUPPORTED)
 
     if options.only_generate_config and options.non_interactive:
         fail("Config generation option only works in interactive mode.", INVALID_PARAMETERS)
